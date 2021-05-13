@@ -38,8 +38,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "cdba-server.h"
+#include "cdba-server-standalone.h"
 #include "device.h"
 #include "fastboot.h"
 #include "console.h"
@@ -72,17 +74,23 @@ static void device_lock(struct device *device)
 	if (!n)
 		return;
 
-	warnx("board is in use, waiting...");
+	if (device->standalone)
+		err(1, "board is in use, exiting...");
+	else
+		warnx("board is in use, waiting...");
 
 	n = flock(fd, LOCK_EX);
 	if (n < 0)
 		err(1, "failed to lock lockfile %s", lock);
 }
 
-struct device *device_open(const char *board,
+struct device *device_open(const void *msg,
 			   struct fastboot_ops *fastboot_ops)
 {
 	struct device *device;
+	const uint8_t *standalone = msg;
+	const uint8_t *lock = msg + sizeof(uint8_t);
+	const char *board = msg + (sizeof(uint8_t) * 2);
 
 	list_for_each_entry(device, &devices, node) {
 		if (!strcmp(device->board, board))
@@ -94,7 +102,11 @@ struct device *device_open(const char *board,
 found:
 	assert(device->open || device->console_dev);
 
-	device_lock(device);
+	device->standalone = *standalone;
+	device->locked = *lock;
+
+	if (device->locked)
+		device_lock(device);
 
 	if (device->open) {
 		device->cdb = device->open(device);
@@ -102,13 +114,17 @@ found:
 			errx(1, "failed to open device controller");
 	}
 
+	if (device->standalone && cdba_server_standalone_create(device) == -1)
+		errx(1, "failed to open standalone server");
+
 	if (device->console_dev)
 		console_open(device);
 
 	if (device->usb_always_on)
 		device_usb(device, true);
 
-	device->fastboot = fastboot_open(device->serial, fastboot_ops, NULL);
+	if (!device->standalone)
+		device->fastboot = fastboot_open(device->serial, fastboot_ops, NULL);
 
 	return device;
 }
@@ -140,7 +156,7 @@ static void device_tick(void *data)
 	switch (device->state) {
 	case DEVICE_STATE_START:
 		/* Make sure power key is not engaged */
-		if (device->fastboot_key_timeout)
+		if (device->fastboot_key_timeout && !device->standalone)
 			device_key(device, DEVICE_KEY_FASTBOOT, true);
 		if (device->has_power_key)
 			device_key(device, DEVICE_KEY_POWER, false);
@@ -156,7 +172,7 @@ static void device_tick(void *data)
 		if (device->has_power_key) {
 			device->state = DEVICE_STATE_PRESS;
 			watch_timer_add(250, device_tick, device);
-		} else if (device->fastboot_key_timeout) {
+		} else if (device->fastboot_key_timeout && !device->standalone) {
 			device->state = DEVICE_STATE_RELEASE_FASTBOOT;
 			watch_timer_add(device->fastboot_key_timeout * 1000, device_tick, device);
 		} else {
@@ -174,7 +190,7 @@ static void device_tick(void *data)
 		/* Release power key */
 		device_key(device, DEVICE_KEY_POWER, false);
 
-		if (device->fastboot_key_timeout) {
+		if (device->fastboot_key_timeout && !device->standalone) {
 			device->state = DEVICE_STATE_RELEASE_FASTBOOT;
 			watch_timer_add(device->fastboot_key_timeout * 1000, device_tick, device);
 		} else {
@@ -315,6 +331,9 @@ void device_close(struct device *dev)
 	if (!dev->usb_always_on)
 		device_usb(dev, false);
 	device_power(dev, false);
+
+	if (dev->standalone)
+		cdba_server_standalone_end(dev);
 
 	if (dev->close)
 		dev->close(dev);

@@ -22,6 +22,8 @@ struct device {
 	unsigned int fastboot_key_timeout;
 	int state;
 	bool has_power_key;
+	int standalone;
+	int locked;
 
 	void (*boot)(struct device *);
 
@@ -42,12 +44,14 @@ struct device {
 	int console_fd;
 	struct termios console_tios;
 
+	int standalone_channel;
+
 	struct list_head node;
 };
 
 void device_add(struct device *device);
 
-struct device *device_open(const char *board, struct fastboot_ops *fastboot_ops);
+struct device *device_open(const void *msg, struct fastboot_ops *fastboot_ops);
 void device_close(struct device *dev);
 int device_power(struct device *device, bool on);
 
